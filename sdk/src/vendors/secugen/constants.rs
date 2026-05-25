@@ -1,0 +1,3 @@
+pub const DEFAULT_TIMEOUT_MS: u32 = 10_000;
+pub const DEFAULT_MIN_QUALITY: u8 = 60;
+pub const DEFAULT_ENROLL_SAMPLES: u8 = 3;

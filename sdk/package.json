@@ -1,0 +1,21 @@
+{
+  "name": "fingerprint-sdk",
+  "version": "0.1.0",
+  "description": "Vendor-agnostic fingerprint scanner SDK for Node.js",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "fingerprint-sdk",
+    "triples": {
+      "defaults": true
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "license": "MIT"
+}

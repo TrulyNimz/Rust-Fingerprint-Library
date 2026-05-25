@@ -1,0 +1,5 @@
+LIBRARY sgwsqlib
+EXPORTS
+    _SGWSQ_Free@4=SGWSQ_Free
+    _SGWSQ_Encode@36=SGWSQ_Encode
+    _SGWSQ_Decode@32=SGWSQ_Decode

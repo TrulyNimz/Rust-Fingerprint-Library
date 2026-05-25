@@ -1,0 +1,8 @@
+[package]
+name = "fingerprint-protocol"
+version.workspace = true
+edition = "2021"
+description = "Shared IPC protocol types for fingerprint-sdk bridge communication"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
