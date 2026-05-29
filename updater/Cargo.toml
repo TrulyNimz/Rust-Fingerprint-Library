@@ -20,6 +20,11 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 thiserror = "1"
 futures-util = "0.3"
+ed25519-dalek = { version = "2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+# Default features (incl. SigningKey + Signer) for generating test signatures.
+ed25519-dalek = "2"

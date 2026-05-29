@@ -1,7 +1,7 @@
 use semver::Version;
 use serde::Deserialize;
 
-use crate::version::{asset_checksum_name, asset_zip_name};
+use crate::version::{asset_checksum_name, asset_signature_name, asset_zip_name};
 
 #[derive(Debug, Deserialize)]
 pub struct GitHubRelease {
@@ -23,6 +23,7 @@ pub struct UpdateInfo {
     pub version: Version,
     pub zip_url: String,
     pub checksum_url: Option<String>,
+    pub signature_url: Option<String>,
     pub release_url: String,
 }
 
@@ -78,6 +79,7 @@ pub async fn check_for_update(
 
     let zip_name = asset_zip_name(tag);
     let checksum_name = asset_checksum_name(tag);
+    let signature_name = asset_signature_name(tag);
 
     let zip_asset = release
         .assets
@@ -86,11 +88,13 @@ pub async fn check_for_update(
         .ok_or_else(|| UpdateError::MissingAsset(zip_name.clone()))?;
 
     let checksum_asset = release.assets.iter().find(|a| a.name == checksum_name);
+    let signature_asset = release.assets.iter().find(|a| a.name == signature_name);
 
     Ok(Some(UpdateInfo {
         version: latest,
         zip_url: zip_asset.browser_download_url.clone(),
         checksum_url: checksum_asset.map(|a| a.browser_download_url.clone()),
+        signature_url: signature_asset.map(|a| a.browser_download_url.clone()),
         release_url: release.html_url,
     }))
 }
@@ -107,7 +111,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum UpdateError {
     #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
     #[error("Invalid version in release tag: {0}")]
     InvalidVersion(String),
     #[error("Release is missing expected asset: {0}")]
@@ -122,4 +126,20 @@ pub enum UpdateError {
     Io(#[from] std::io::Error),
     #[error("Manifest error: {0}")]
     Manifest(String),
+    #[error("Update signature verification failed: {0}")]
+    SignatureInvalid(String),
+    #[error("Update is not signed and --allow-unsigned was not specified")]
+    SignatureMissing,
+    #[error("Updater built without an embedded public key; cannot verify signatures")]
+    NoPublicKey,
+}
+
+// Manual From impl: strip the request URL before storing the error.
+// reqwest::Error's Display does not include headers, so the GITHUB_TOKEN can't
+// leak that way — but the URL may carry tokens in pathological setups, so we
+// drop it deliberately. See `reqwest::Error::without_url`.
+impl From<reqwest::Error> for UpdateError {
+    fn from(e: reqwest::Error) -> Self {
+        UpdateError::Http(e.without_url())
+    }
 }

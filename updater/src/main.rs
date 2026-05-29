@@ -31,6 +31,11 @@ enum Commands {
         /// Force re-download even if already up to date
         #[arg(long)]
         force: bool,
+        /// Skip Ed25519 signature verification. DANGEROUS — only use for
+        /// internal/dev builds where the release pipeline does not produce
+        /// signatures yet.
+        #[arg(long)]
+        allow_unsigned: bool,
     },
     /// Roll back to the previous version from backup
     Rollback,
@@ -57,8 +62,17 @@ async fn main() {
         Commands::Check => {
             cmd_check(&owner, &repo, &current, cli.pre_release).await
         }
-        Commands::Update { force } => {
-            cmd_update(&owner, &repo, &install_dir, &current, cli.pre_release, force).await
+        Commands::Update { force, allow_unsigned } => {
+            cmd_update(
+                &owner,
+                &repo,
+                &install_dir,
+                &current,
+                cli.pre_release,
+                force,
+                allow_unsigned,
+            )
+            .await
         }
         Commands::Rollback => {
             cmd_rollback(&install_dir)
@@ -110,12 +124,21 @@ async fn cmd_update(
     current: &semver::Version,
     pre_release: bool,
     force: bool,
+    allow_unsigned: bool,
 ) -> Result<(), fingerprint_updater::github::UpdateError> {
     println!("Current version: v{current}");
     println!("Install directory: {}", install_dir.display());
 
-    fingerprint_updater::perform_update(owner, repo, install_dir, current, pre_release, force)
-        .await?;
+    fingerprint_updater::perform_update(
+        owner,
+        repo,
+        install_dir,
+        current,
+        pre_release,
+        force,
+        allow_unsigned,
+    )
+    .await?;
 
     Ok(())
 }

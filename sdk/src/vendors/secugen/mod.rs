@@ -1,10 +1,15 @@
 pub mod constants;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
 use fingerprint_protocol::{BridgeCommand, BridgeResponse, ResponseData, TemplateEntry};
+use zeroize::Zeroize;
+
+/// Mirror of bridge/src/main.rs::MAX_IPC_LINE. Caps inbound payloads from the
+/// 32-bit bridge so a corrupted/runaway response can't OOM the host process.
+const MAX_IPC_LINE: usize = 64 * 1024 * 1024;
 
 use crate::fp_core::errors::FingerprintError;
 use crate::fp_core::traits::FingerprintScanner;
@@ -31,7 +36,7 @@ impl SecuGenScanner {
     fn find_bridge_exe() -> Result<String, FingerprintError> {
         let bridge_name = "secugen-bridge.exe";
 
-        // 1. SECUGEN_BRIDGE_PATH env var (exact path)
+        // 1. SECUGEN_BRIDGE_PATH env var (explicit, operator-controlled)
         if let Ok(path) = std::env::var("SECUGEN_BRIDGE_PATH") {
             if std::path::Path::new(&path).exists() {
                 return Ok(path);
@@ -46,13 +51,10 @@ impl SecuGenScanner {
             }
         }
 
-        // 3. Current working directory
-        let cwd_bridge = std::path::Path::new(bridge_name);
-        if cwd_bridge.exists() {
-            return Ok(bridge_name.to_string());
-        }
-
-        // 4. Next to node.exe (fallback)
+        // 3. Next to node.exe (fallback for legacy layouts)
+        //    NOTE: CWD lookup is intentionally NOT supported — a process whose
+        //    working directory is attacker-writable would otherwise spawn a
+        //    planted secugen-bridge.exe.
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let bridge = dir.join(bridge_name);
@@ -124,10 +126,13 @@ impl SecuGenScanner {
     fn spawn_bridge() -> Result<BridgeProcess, FingerprintError> {
         let exe_path = Self::find_bridge_exe()?;
 
+        // Inherit stderr so the bridge's diagnostic output reaches the host
+        // process's console; discarding it (Stdio::null) makes silent crashes
+        // and DLL-load failures very hard to debug in production.
         let mut child = Command::new(&exe_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| {
                 FingerprintError::SdkError(format!("Failed to start bridge process: {}", e))
@@ -145,17 +150,39 @@ impl SecuGenScanner {
 
     fn send_command(
         bridge: &mut BridgeProcess,
+        cmd: &mut BridgeCommand,
+    ) -> Result<ResponseData, FingerprintError> {
+        let result = Self::send_command_inner(bridge, cmd);
+        // Wipe biometric bytes carried by the command after send completes,
+        // covering every early-return path inside send_command_inner.
+        match cmd {
+            BridgeCommand::Verify { template_data, .. } => template_data.zeroize(),
+            BridgeCommand::Identify { templates } => {
+                for t in templates.iter_mut() {
+                    t.data.zeroize();
+                }
+            }
+            BridgeCommand::GetQuality { image } => image.zeroize(),
+            _ => {}
+        }
+        result
+    }
+
+    fn send_command_inner(
+        bridge: &mut BridgeProcess,
         cmd: &BridgeCommand,
     ) -> Result<ResponseData, FingerprintError> {
         let stdin = bridge.child.stdin.as_mut().ok_or_else(|| {
             FingerprintError::SdkError("Bridge stdin not available".to_string())
         })?;
 
-        let json = serde_json::to_string(cmd).map_err(|e| {
+        let mut json = serde_json::to_string(cmd).map_err(|e| {
             FingerprintError::SdkError(format!("Failed to serialize command: {}", e))
         })?;
 
-        writeln!(stdin, "{}", json).map_err(|e| {
+        let write_res = writeln!(stdin, "{}", json);
+        json.zeroize();
+        write_res.map_err(|e| {
             FingerprintError::SdkError(format!("Failed to write to bridge: {}", e))
         })?;
 
@@ -164,17 +191,32 @@ impl SecuGenScanner {
         })?;
 
         let mut line = String::new();
-        bridge.reader.read_line(&mut line).map_err(|e| {
-            FingerprintError::SdkError(format!("Failed to read bridge response: {}", e))
-        })?;
+        let n = bridge
+            .reader
+            .by_ref()
+            .take(MAX_IPC_LINE as u64)
+            .read_line(&mut line)
+            .map_err(|e| {
+                FingerprintError::SdkError(format!("Failed to read bridge response: {}", e))
+            })?;
+        if n == MAX_IPC_LINE && !line.ends_with('\n') {
+            line.zeroize();
+            return Err(FingerprintError::SdkError(format!(
+                "Bridge response exceeds {} bytes (framing error)",
+                MAX_IPC_LINE
+            )));
+        }
 
         if line.trim().is_empty() {
+            line.zeroize();
             return Err(FingerprintError::SdkError(
                 "Bridge process returned empty response (may have crashed)".to_string(),
             ));
         }
 
-        let response: BridgeResponse = serde_json::from_str(line.trim()).map_err(|e| {
+        let parse_res = serde_json::from_str::<BridgeResponse>(line.trim());
+        line.zeroize();
+        let response = parse_res.map_err(|e| {
             FingerprintError::SdkError(format!("Failed to parse bridge response: {}", e))
         })?;
 
@@ -198,7 +240,7 @@ impl SecuGenScanner {
     where
         F: FnOnce(&mut BridgeProcess) -> Result<T, FingerprintError>,
     {
-        let mut guard = self.bridge.lock().unwrap();
+        let mut guard = self.bridge.lock().unwrap_or_else(|e| e.into_inner());
         let bridge = guard.as_mut().ok_or(FingerprintError::NotInitialized)?;
         f(bridge)
     }
@@ -207,9 +249,9 @@ impl SecuGenScanner {
 impl FingerprintScanner for SecuGenScanner {
     fn init(&self) -> Result<DeviceInfo, FingerprintError> {
         let mut bridge = Self::spawn_bridge()?;
-        let data = Self::send_command(&mut bridge, &BridgeCommand::Init)?;
+        let data = Self::send_command(&mut bridge, &mut BridgeCommand::Init)?;
 
-        *self.bridge.lock().unwrap() = Some(bridge);
+        *self.bridge.lock().unwrap_or_else(|e| e.into_inner()) = Some(bridge);
 
         match data {
             ResponseData::DeviceInfo {
@@ -239,7 +281,7 @@ impl FingerprintScanner for SecuGenScanner {
         self.with_bridge(|bridge| {
             let data = Self::send_command(
                 bridge,
-                &BridgeCommand::Capture {
+                &mut BridgeCommand::Capture {
                     timeout_ms,
                     min_quality,
                 },
@@ -274,7 +316,7 @@ impl FingerprintScanner for SecuGenScanner {
         self.with_bridge(|bridge| {
             let data = Self::send_command(
                 bridge,
-                &BridgeCommand::Enroll {
+                &mut BridgeCommand::Enroll {
                     user_id: user_id.to_string(),
                     samples,
                 },
@@ -301,7 +343,7 @@ impl FingerprintScanner for SecuGenScanner {
         self.with_bridge(|bridge| {
             let data = Self::send_command(
                 bridge,
-                &BridgeCommand::Verify {
+                &mut BridgeCommand::Verify {
                     user_id: user_id.to_string(),
                     template_data: template.data.clone(),
                 },
@@ -336,7 +378,7 @@ impl FingerprintScanner for SecuGenScanner {
         self.with_bridge(|bridge| {
             let data = Self::send_command(
                 bridge,
-                &BridgeCommand::Identify {
+                &mut BridgeCommand::Identify {
                     templates: entries,
                 },
             )?;
@@ -362,7 +404,7 @@ impl FingerprintScanner for SecuGenScanner {
         self.with_bridge(|bridge| {
             let data = Self::send_command(
                 bridge,
-                &BridgeCommand::GetQuality {
+                &mut BridgeCommand::GetQuality {
                     image: image.to_vec(),
                 },
             )?;
@@ -377,9 +419,9 @@ impl FingerprintScanner for SecuGenScanner {
     }
 
     fn disconnect(&self) -> Result<(), FingerprintError> {
-        let mut guard = self.bridge.lock().unwrap();
+        let mut guard = self.bridge.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut bridge) = guard.take() {
-            let _ = Self::send_command(&mut bridge, &BridgeCommand::Disconnect);
+            let _ = Self::send_command(&mut bridge, &mut BridgeCommand::Disconnect);
             let _ = bridge.child.kill();
             let _ = bridge.child.wait();
         }

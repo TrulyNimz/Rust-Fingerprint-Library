@@ -24,6 +24,10 @@ pub struct FileEntry {
 }
 
 /// Full update orchestration: check → download → verify → apply.
+///
+/// `allow_unsigned` lets development/CI flows skip signature verification.
+/// In production this MUST be false; otherwise an attacker who can replace the
+/// release zip can ship arbitrary code to every updater install.
 pub async fn perform_update(
     owner: &str,
     repo: &str,
@@ -31,6 +35,7 @@ pub async fn perform_update(
     current: &Version,
     include_prerelease: bool,
     force: bool,
+    allow_unsigned: bool,
 ) -> Result<Version, UpdateError> {
     // Step 0: Clean up old files from previous updates
     apply::cleanup_old_files(install_dir)?;
@@ -48,6 +53,7 @@ pub async fn perform_update(
 
         let zip_name = version::asset_zip_name(tag);
         let checksum_name = version::asset_checksum_name(tag);
+        let signature_name = version::asset_signature_name(tag);
 
         let zip_asset = release
             .assets
@@ -56,11 +62,13 @@ pub async fn perform_update(
             .ok_or_else(|| UpdateError::MissingAsset(zip_name))?;
 
         let checksum_asset = release.assets.iter().find(|a| a.name == checksum_name);
+        let signature_asset = release.assets.iter().find(|a| a.name == signature_name);
 
         github::UpdateInfo {
             version: ver,
             zip_url: zip_asset.browser_download_url.clone(),
             checksum_url: checksum_asset.map(|a| a.browser_download_url.clone()),
+            signature_url: signature_asset.map(|a| a.browser_download_url.clone()),
             release_url: release.html_url,
         }
     } else {
@@ -86,7 +94,37 @@ pub async fn perform_update(
     .await?;
     eprintln!();
 
-    // Step 3: Verify checksum if available
+    // Step 3a: Verify Ed25519 signature. This is the only check that proves
+    // authenticity — SHA256 alone only proves integrity in transit. If the
+    // updater was built without an embedded pubkey, refuse unless the operator
+    // explicitly opted in via --allow-unsigned.
+    match (version::UPDATE_PUBKEY_HEX, info.signature_url.as_ref()) {
+        (Some(pubkey_hex), Some(sig_url)) => {
+            println!("Verifying signature...");
+            let signature_bytes = assets::download_bytes(sig_url).await?;
+            let zip_bytes = std::fs::read(&zip_path)?;
+            assets::verify_signature(&zip_bytes, &signature_bytes, pubkey_hex)?;
+            println!("Signature OK.");
+        }
+        (Some(_), None) => {
+            if !allow_unsigned {
+                return Err(UpdateError::SignatureMissing);
+            }
+            eprintln!(
+                "WARNING: release has no .sig asset; proceeding because --allow-unsigned was set."
+            );
+        }
+        (None, _) => {
+            if !allow_unsigned {
+                return Err(UpdateError::NoPublicKey);
+            }
+            eprintln!(
+                "WARNING: updater built without FINGERPRINT_UPDATE_PUBKEY; signature verification disabled."
+            );
+        }
+    }
+
+    // Step 3b: Verify checksum if available (defense in depth)
     if let Some(ref checksum_url) = info.checksum_url {
         println!("Verifying checksum...");
         let expected = assets::download_checksum(checksum_url).await?;
@@ -213,7 +251,11 @@ fn write_update_record(install_dir: &Path, version: &Version) -> Result<(), Upda
         "updated_at": chrono_lite_now(),
     });
     let path = install_dir.join("last-update.json");
-    std::fs::write(path, serde_json::to_string_pretty(&record).unwrap())?;
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&record)
+            .expect("update-record serialization is infallible"),
+    )?;
     Ok(())
 }
 
@@ -221,6 +263,6 @@ fn chrono_lite_now() -> String {
     // Simple ISO-ish timestamp without pulling in chrono
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
+        .unwrap_or_default();
     format!("{}", d.as_secs())
 }

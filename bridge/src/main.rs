@@ -1,12 +1,41 @@
 mod ffi;
 
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fingerprint_protocol::{BridgeCommand, BridgeResponse, ResponseData, TemplateEntry};
 use libc::c_long;
+use zeroize::Zeroize;
+
+/// Maximum size of a single JSON IPC line, in bytes. Large enough to carry a
+/// JSON-encoded high-res fingerprint image with headroom; small enough to
+/// reject runaway/corrupted state before it OOMs the process.
+const MAX_IPC_LINE: usize = 64 * 1024 * 1024;
+
+/// Read one '\n'-terminated line from `reader`, capped at `MAX_IPC_LINE`.
+fn read_ipc_line<R: BufRead>(reader: &mut R, buf: &mut String) -> io::Result<usize> {
+    read_ipc_line_with_limit(reader, buf, MAX_IPC_LINE)
+}
+
+/// Bounded `read_line` with explicit limit. Errors with `InvalidData` if the
+/// limit is hit before a newline. Factored out so tests can hit boundary
+/// conditions without allocating 64 MB of input.
+fn read_ipc_line_with_limit<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+    limit: usize,
+) -> io::Result<usize> {
+    let n = reader.by_ref().take(limit as u64).read_line(buf)?;
+    if n == limit && !buf.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("IPC line exceeds {} bytes", limit),
+        ));
+    }
+    Ok(n)
+}
 
 use ffi::{SGFingerInfo, SgfpLib, HSGFPM};
 
@@ -52,6 +81,39 @@ fn err_response(code: &str, message: &str) -> BridgeResponse {
     BridgeResponse::Error {
         code: code.to_string(),
         message: message.to_string(),
+    }
+}
+
+/// Wipe biometric byte buffers carried in a response so they don't linger in
+/// the allocator after this command finishes. Called after the response has
+/// already been serialized and written to stdout.
+fn zeroize_response(resp: &mut BridgeResponse) {
+    if let BridgeResponse::Ok { data } = resp {
+        match data {
+            ResponseData::ScanResult { image, template, .. } => {
+                image.zeroize();
+                template.zeroize();
+            }
+            ResponseData::Template { data, .. } => {
+                data.zeroize();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Wipe biometric byte buffers carried in an incoming command before the
+/// command struct is dropped.
+fn zeroize_command(cmd: &mut BridgeCommand) {
+    match cmd {
+        BridgeCommand::Verify { template_data, .. } => template_data.zeroize(),
+        BridgeCommand::Identify { templates } => {
+            for t in templates.iter_mut() {
+                t.data.zeroize();
+            }
+        }
+        BridgeCommand::GetQuality { image } => image.zeroize(),
+        _ => {}
     }
 }
 
@@ -238,19 +300,28 @@ fn handle_enroll(state: &Option<ScannerState>, user_id: &str, samples: u8) -> Br
     let mut best_quality: i32 = -1;
 
     for _ in 0..sample_count {
-        let (image, quality) = match capture_image(s, 10_000, 60) {
+        let (mut image, quality) = match capture_image(s, 10_000, 60) {
             Ok(r) => r,
             Err(resp) => return resp,
         };
 
         let template = match create_template_from_image(s, &image) {
             Ok(t) => t,
-            Err(resp) => return resp,
+            Err(resp) => {
+                image.zeroize();
+                return resp;
+            }
         };
+        image.zeroize();
 
         if (quality as i32) > best_quality {
             best_quality = quality as i32;
-            best_template = Some(template);
+            if let Some(mut old) = best_template.replace(template) {
+                old.zeroize();
+            }
+        } else {
+            let mut discarded = template;
+            discarded.zeroize();
         }
     }
 
@@ -276,28 +347,37 @@ fn handle_verify(
         None => return err_response("NOT_INITIALIZED", "Scanner not initialized"),
     };
 
-    let (image, _) = match capture_image(s, 10_000, 60) {
+    let (mut image, _) = match capture_image(s, 10_000, 60) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
 
-    let live_template = match create_template_from_image(s, &image) {
+    let mut live_template = match create_template_from_image(s, &image) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => {
+            image.zeroize();
+            return resp;
+        }
     };
 
-    let score = match s
+    let score_res = s
         .lib
-        .get_matching_score(s.handle, &live_template, template_data)
-    {
+        .get_matching_score(s.handle, &live_template, template_data);
+    let score = match score_res {
         Ok(score) => score,
-        Err(code) => return map_sdk_error(code),
+        Err(code) => {
+            image.zeroize();
+            live_template.zeroize();
+            return map_sdk_error(code);
+        }
     };
 
-    let matched = match s
+    let match_res = s
         .lib
-        .match_template(s.handle, &live_template, template_data, SG_SECURITY_NORMAL)
-    {
+        .match_template(s.handle, &live_template, template_data, SG_SECURITY_NORMAL);
+    image.zeroize();
+    live_template.zeroize();
+    let matched = match match_res {
         Ok(m) => m,
         Err(code) => return map_sdk_error(code),
     };
@@ -328,14 +408,17 @@ fn handle_identify(
         return err_response("MATCH_FAILED", "No templates provided");
     }
 
-    let (image, _) = match capture_image(s, 10_000, 60) {
+    let (mut image, _) = match capture_image(s, 10_000, 60) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
 
-    let live_template = match create_template_from_image(s, &image) {
+    let mut live_template = match create_template_from_image(s, &image) {
         Ok(t) => t,
-        Err(resp) => return resp,
+        Err(resp) => {
+            image.zeroize();
+            return resp;
+        }
     };
 
     let mut best_score: c_long = 0;
@@ -348,7 +431,11 @@ fn handle_identify(
             .get_matching_score(s.handle, &live_template, &tmpl.data)
         {
             Ok(score) => score,
-            Err(code) => return map_sdk_error(code),
+            Err(code) => {
+                image.zeroize();
+                live_template.zeroize();
+                return map_sdk_error(code);
+            }
         };
 
         if score > best_score {
@@ -359,10 +446,12 @@ fn handle_identify(
     }
 
     if let Some(data) = best_data {
-        let matched = match s
+        let match_res = s
             .lib
-            .match_template(s.handle, &live_template, data, SG_SECURITY_NORMAL)
-        {
+            .match_template(s.handle, &live_template, data, SG_SECURITY_NORMAL);
+        image.zeroize();
+        live_template.zeroize();
+        let matched = match match_res {
             Ok(m) => m,
             Err(code) => return map_sdk_error(code),
         };
@@ -379,6 +468,8 @@ fn handle_identify(
             },
         }
     } else {
+        image.zeroize();
+        live_template.zeroize();
         BridgeResponse::Ok {
             data: ResponseData::MatchResult {
                 matched: false,
@@ -424,28 +515,42 @@ fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut state: Option<ScannerState> = None;
+    let mut reader = stdin.lock();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break, // stdin closed
+    loop {
+        let mut line = String::new();
+        let n = match read_ipc_line(&mut reader, &mut line) {
+            Ok(0) => break, // EOF
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                // Oversized or non-UTF8 line — reply with an error and exit.
+                // We can't safely resync the stream after a framing violation.
+                let resp = err_response("SDK_ERROR", &format!("IPC framing error: {}", e));
+                let _ = writeln!(stdout, "{}", serde_json::to_string(&resp).expect("BridgeResponse serialization is infallible"));
+                let _ = stdout.flush();
+                break;
+            }
+            Err(_) => break, // unrecoverable IO error
         };
+        let _ = n;
 
         if line.trim().is_empty() {
             continue;
         }
 
-        let cmd: BridgeCommand = match serde_json::from_str(&line) {
+        let mut cmd: BridgeCommand = match serde_json::from_str(&line) {
             Ok(cmd) => cmd,
             Err(e) => {
+                line.zeroize();
                 let resp = err_response("SDK_ERROR", &format!("Invalid command: {}", e));
-                let _ = writeln!(stdout, "{}", serde_json::to_string(&resp).unwrap());
+                let _ = writeln!(stdout, "{}", serde_json::to_string(&resp).expect("BridgeResponse serialization is infallible"));
                 let _ = stdout.flush();
                 continue;
             }
         };
+        line.zeroize();
 
-        let response = match cmd {
+        let mut response = match cmd {
             BridgeCommand::Init => handle_init(&mut state),
             BridgeCommand::Capture {
                 timeout_ms,
@@ -463,10 +568,248 @@ fn main() {
             BridgeCommand::Disconnect => handle_disconnect(&mut state),
         };
 
-        let _ = writeln!(stdout, "{}", serde_json::to_string(&response).unwrap());
+        let mut json = serde_json::to_string(&response)
+            .expect("BridgeResponse serialization is infallible");
+        let _ = writeln!(stdout, "{}", json);
         let _ = stdout.flush();
+
+        // Wipe biometric bytes from the serialized payload and the in-memory
+        // command/response structs before they drop.
+        json.zeroize();
+        zeroize_response(&mut response);
+        zeroize_command(&mut cmd);
     }
 
     // Cleanup on exit
     handle_disconnect(&mut state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    // ─── read_ipc_line_with_limit ────────────────────────────────────────────
+
+    #[test]
+    fn read_ipc_line_reads_normal_line() {
+        let input: &[u8] = b"hello\nworld\n";
+        let mut reader = Cursor::new(input);
+        let mut buf = String::new();
+        let n = read_ipc_line_with_limit(&mut reader, &mut buf, 1024).unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(buf, "hello\n");
+    }
+
+    #[test]
+    fn read_ipc_line_returns_zero_at_eof() {
+        let input: &[u8] = b"";
+        let mut reader = Cursor::new(input);
+        let mut buf = String::new();
+        let n = read_ipc_line_with_limit(&mut reader, &mut buf, 1024).unwrap();
+        assert_eq!(n, 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn read_ipc_line_rejects_oversized() {
+        // Limit = 10, line = 20 bytes without newline → must error.
+        let input: &[u8] = b"xxxxxxxxxxxxxxxxxxxx";
+        let mut reader = Cursor::new(input);
+        let mut buf = String::new();
+        match read_ipc_line_with_limit(&mut reader, &mut buf, 10) {
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                assert!(e.to_string().contains("exceeds 10"));
+            }
+            other => panic!("expected InvalidData, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn read_ipc_line_accepts_line_exactly_at_limit_with_newline() {
+        // 9 chars + '\n' = 10 bytes; limit = 10. Should succeed cleanly.
+        let input: &[u8] = b"abcdefghi\n";
+        let mut reader = Cursor::new(input);
+        let mut buf = String::new();
+        let n = read_ipc_line_with_limit(&mut reader, &mut buf, 10).unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(buf, "abcdefghi\n");
+    }
+
+    #[test]
+    fn read_ipc_line_handles_short_line_without_trailing_newline() {
+        // EOF before newline: legitimate "last line", not an overflow.
+        let input: &[u8] = b"abc";
+        let mut reader = Cursor::new(input);
+        let mut buf = String::new();
+        let n = read_ipc_line_with_limit(&mut reader, &mut buf, 1024).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(buf, "abc");
+    }
+
+    // ─── zeroize_response ────────────────────────────────────────────────────
+
+    #[test]
+    fn zeroize_response_wipes_scan_result() {
+        let mut resp = BridgeResponse::Ok {
+            data: ResponseData::ScanResult {
+                image: vec![1, 2, 3, 4, 5],
+                quality: 80,
+                template: vec![9, 8, 7, 6],
+                timestamp: 12345,
+            },
+        };
+        zeroize_response(&mut resp);
+        match resp {
+            BridgeResponse::Ok {
+                data:
+                    ResponseData::ScanResult {
+                        image,
+                        template,
+                        quality,
+                        timestamp,
+                    },
+            } => {
+                // zeroize::Zeroize on Vec<u8> writes zeros then truncates.
+                assert!(image.is_empty(), "image bytes not wiped");
+                assert!(template.is_empty(), "template bytes not wiped");
+                // Scalars untouched (no biometric content).
+                assert_eq!(quality, 80);
+                assert_eq!(timestamp, 12345);
+            }
+            _ => panic!("unexpected response shape after zeroize"),
+        }
+    }
+
+    #[test]
+    fn zeroize_response_wipes_template_data() {
+        let mut resp = BridgeResponse::Ok {
+            data: ResponseData::Template {
+                user_id: "alice".into(),
+                data: vec![0xAB; 32],
+                created_at: 0,
+            },
+        };
+        zeroize_response(&mut resp);
+        match resp {
+            BridgeResponse::Ok {
+                data: ResponseData::Template { user_id, data, .. },
+            } => {
+                assert_eq!(user_id, "alice"); // user_id is not biometric
+                assert!(data.is_empty(), "template data not wiped");
+            }
+            _ => panic!("unexpected response shape"),
+        }
+    }
+
+    #[test]
+    fn zeroize_response_noop_on_non_biometric_variants() {
+        let mut resp = BridgeResponse::Ok {
+            data: ResponseData::MatchResult {
+                matched: true,
+                score: 42,
+                user_id: Some("bob".into()),
+            },
+        };
+        zeroize_response(&mut resp); // must not panic
+        if let BridgeResponse::Ok {
+            data: ResponseData::MatchResult { matched, score, user_id },
+        } = resp
+        {
+            assert!(matched);
+            assert_eq!(score, 42);
+            assert_eq!(user_id.as_deref(), Some("bob"));
+        } else {
+            panic!("response shape changed");
+        }
+    }
+
+    #[test]
+    fn zeroize_response_noop_on_error() {
+        let mut resp = BridgeResponse::Error {
+            code: "X".into(),
+            message: "y".into(),
+        };
+        zeroize_response(&mut resp); // must not panic on Error variant
+    }
+
+    // ─── zeroize_command ─────────────────────────────────────────────────────
+
+    #[test]
+    fn zeroize_command_wipes_verify_template() {
+        let mut cmd = BridgeCommand::Verify {
+            user_id: "alice".into(),
+            template_data: vec![0xCD; 128],
+        };
+        zeroize_command(&mut cmd);
+        match cmd {
+            BridgeCommand::Verify {
+                user_id,
+                template_data,
+            } => {
+                assert_eq!(user_id, "alice");
+                assert!(template_data.is_empty(), "verify template_data not wiped");
+            }
+            _ => panic!("command shape changed"),
+        }
+    }
+
+    #[test]
+    fn zeroize_command_wipes_identify_templates() {
+        let mut cmd = BridgeCommand::Identify {
+            templates: vec![
+                TemplateEntry {
+                    user_id: "a".into(),
+                    data: vec![1, 2, 3],
+                },
+                TemplateEntry {
+                    user_id: "b".into(),
+                    data: vec![4, 5, 6],
+                },
+            ],
+        };
+        zeroize_command(&mut cmd);
+        if let BridgeCommand::Identify { templates } = cmd {
+            assert_eq!(templates.len(), 2);
+            assert_eq!(templates[0].user_id, "a");
+            assert_eq!(templates[1].user_id, "b");
+            for t in &templates {
+                assert!(t.data.is_empty(), "identify template bytes not wiped");
+            }
+        } else {
+            panic!("command shape changed");
+        }
+    }
+
+    #[test]
+    fn zeroize_command_wipes_get_quality_image() {
+        let mut cmd = BridgeCommand::GetQuality {
+            image: vec![7u8; 256],
+        };
+        zeroize_command(&mut cmd);
+        if let BridgeCommand::GetQuality { image } = cmd {
+            assert!(image.is_empty());
+        } else {
+            panic!("command shape changed");
+        }
+    }
+
+    #[test]
+    fn zeroize_command_noop_on_non_biometric_variants() {
+        // Variants without biometric byte buffers: must not panic.
+        let mut init = BridgeCommand::Init;
+        zeroize_command(&mut init);
+        let mut disconnect = BridgeCommand::Disconnect;
+        zeroize_command(&mut disconnect);
+        let mut capture = BridgeCommand::Capture {
+            timeout_ms: 1000,
+            min_quality: 60,
+        };
+        zeroize_command(&mut capture);
+        let mut enroll = BridgeCommand::Enroll {
+            user_id: "x".into(),
+            samples: 3,
+        };
+        zeroize_command(&mut enroll);
+    }
 }

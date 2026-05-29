@@ -25,7 +25,7 @@ impl UpdatePlan {
     ) -> Result<Self, UpdateError> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let backup_dir = install_dir.join(format!(".update-backup-{timestamp}"));

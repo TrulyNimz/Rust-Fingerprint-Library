@@ -105,7 +105,7 @@ impl NeurotecScanner {
     }
 
     fn find_sdk_dir() -> Result<String, FingerprintError> {
-        // 1. NEUROTEC_SDK_PATH env var
+        // 1. NEUROTEC_SDK_PATH env var (explicit, operator-controlled)
         if let Ok(path) = std::env::var("NEUROTEC_SDK_PATH") {
             let dll = std::path::Path::new(&path).join("Nffv.dll");
             if dll.exists() {
@@ -113,11 +113,8 @@ impl NeurotecScanner {
             }
         }
 
-        // 2. Known install path from our download
-        let known_paths = [
-            "D:/Projects/API/Fingerprint-Rust/neurotechnology-sdk/FreeFingerprintVerification_3_0_SDK/Bin/Win64_x64",
-            "C:/Neurotechnology/FFV SDK/Bin/Win64_x64",
-        ];
+        // 2. Known SDK install path
+        let known_paths = ["C:/Neurotechnology/FFV SDK/Bin/Win64_x64"];
         for p in &known_paths {
             let dll = std::path::Path::new(p).join("Nffv.dll");
             if dll.exists() {
@@ -125,7 +122,8 @@ impl NeurotecScanner {
             }
         }
 
-        // 3. Same directory as node.exe
+        // 3. Same directory as node.exe (writable only by the user who
+        //    installed Node, so trustworthy in normal deployments)
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let dll = dir.join("Nffv.dll");
@@ -133,11 +131,6 @@ impl NeurotecScanner {
                     return Ok(dir.to_string_lossy().to_string());
                 }
             }
-        }
-
-        // 4. Current working directory
-        if std::path::Path::new("Nffv.dll").exists() {
-            return Ok(".".to_string());
         }
 
         Err(FingerprintError::SdkError(
@@ -164,24 +157,46 @@ impl NeurotecScanner {
 
     fn load_dll(sdk_dir: &str) -> Result<NffvLib, FingerprintError> {
         use std::ffi::c_void;
+        use std::sync::Once;
 
-        // Windows API imports
+        // Hardened DLL loader flags — see bridge/src/ffi.rs for rationale.
+        const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+        const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+        const LOAD_LIBRARY_SEARCH_USER_DIRS: u32 = 0x0000_0400;
+
         extern "system" {
-            fn LoadLibraryW(name: *const u16) -> *mut c_void;
+            fn LoadLibraryExW(path: *const u16, h_file: *mut c_void, flags: u32) -> *mut c_void;
             fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
-            fn SetDllDirectoryW(path: *const u16) -> i32;
+            fn AddDllDirectory(new_directory: *const u16) -> *mut c_void;
+            fn SetDefaultDllDirectories(flags: u32) -> i32;
         }
 
-        // Set DLL search directory so Nffv.dll can find its scanner modules
+        // Restrict process-wide DLL search to System32 + dirs we add. Idempotent.
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| unsafe {
+            SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
+        });
+
+        // Add the SDK directory so Nffv.dll's scanner modules resolve from it.
         let sdk_dir_wide = Self::to_wide(sdk_dir);
-        unsafe {
-            SetDllDirectoryW(sdk_dir_wide.as_ptr());
+        let cookie = unsafe { AddDllDirectory(sdk_dir_wide.as_ptr()) };
+        if cookie.is_null() {
+            return Err(FingerprintError::SdkError(format!(
+                "AddDllDirectory failed for {}",
+                sdk_dir
+            )));
         }
 
         let dll_path = format!("{}\\Nffv.dll", sdk_dir.replace('/', "\\"));
         let dll_path_wide = Self::to_wide(&dll_path);
 
-        let handle = unsafe { LoadLibraryW(dll_path_wide.as_ptr()) };
+        let handle = unsafe {
+            LoadLibraryExW(
+                dll_path_wide.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
+        };
         if handle.is_null() {
             return Err(FingerprintError::SdkError(format!(
                 "Failed to load Nffv.dll from {}",
@@ -253,7 +268,7 @@ impl NeurotecScanner {
     where
         F: FnOnce(&NffvLib) -> Result<T, FingerprintError>,
     {
-        let guard = self.lib.lock().unwrap();
+        let guard = self.lib.lock().unwrap_or_else(|e| e.into_inner());
         let lib = guard.as_ref().ok_or(FingerprintError::NotInitialized)?;
         f(lib)
     }
@@ -316,7 +331,7 @@ impl FingerprintScanner for NeurotecScanner {
             "Neurotec FFV"
         };
 
-        *self.lib.lock().unwrap() = Some(lib);
+        *self.lib.lock().unwrap_or_else(|e| e.into_inner()) = Some(lib);
 
         Ok(DeviceInfo {
             vendor: vendor.to_string(),
@@ -528,7 +543,7 @@ impl FingerprintScanner for NeurotecScanner {
     }
 
     fn disconnect(&self) -> Result<(), FingerprintError> {
-        let mut guard = self.lib.lock().unwrap();
+        let mut guard = self.lib.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(lib) = guard.as_ref() {
             unsafe {
                 (lib.uninitialize)();

@@ -27,7 +27,7 @@ pub async fn check_for_update() -> napi::Result<UpdateInfo> {
     let client = reqwest::Client::builder()
         .user_agent("fingerprint-sdk")
         .build()
-        .map_err(|e| napi::Error::from_reason(format!("HTTP client error: {e}")))?;
+        .map_err(|e| napi::Error::from_reason(format!("HTTP client error: {}", e.without_url())))?;
 
     let url = format!(
         "https://api.github.com/repos/{DEFAULT_OWNER}/{DEFAULT_REPO}/releases/latest"
@@ -39,7 +39,7 @@ pub async fn check_for_update() -> napi::Result<UpdateInfo> {
     }
 
     let resp = req.send().await.map_err(|e| {
-        napi::Error::from_reason(format!("Failed to check for updates: {e}"))
+        napi::Error::from_reason(format!("Failed to check for updates: {}", e.without_url()))
     })?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -53,10 +53,12 @@ pub async fn check_for_update() -> napi::Result<UpdateInfo> {
 
     let release: GitHubRelease = resp
         .error_for_status()
-        .map_err(|e| napi::Error::from_reason(format!("GitHub API error: {e}")))?
+        .map_err(|e| napi::Error::from_reason(format!("GitHub API error: {}", e.without_url())))?
         .json()
         .await
-        .map_err(|e| napi::Error::from_reason(format!("Failed to parse response: {e}")))?;
+        .map_err(|e| {
+            napi::Error::from_reason(format!("Failed to parse response: {}", e.without_url()))
+        })?;
 
     let tag = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
     let latest = semver::Version::parse(tag)

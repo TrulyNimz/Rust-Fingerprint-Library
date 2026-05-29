@@ -359,7 +359,7 @@ impl FingerprintScanner for WbfScanner {
             )));
         }
 
-        *self.state.lock().unwrap() = Some(WbfState { session, unit_id });
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(WbfState { session, unit_id });
 
         // Use description as model if model is empty
         let display_model = if model.is_empty() { description } else { model };
@@ -381,7 +381,7 @@ impl FingerprintScanner for WbfScanner {
     }
 
     fn capture(&self, _timeout_ms: u32, _min_quality: u8) -> Result<ScanResult, FingerprintError> {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let state = guard.as_ref().ok_or(FingerprintError::NotInitialized)?;
 
         // WinBioIdentify: blocks until a finger is placed and matched
@@ -483,7 +483,7 @@ impl FingerprintScanner for WbfScanner {
     }
 
     fn disconnect(&self) -> Result<(), FingerprintError> {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = guard.take() {
             unsafe { WinBioCloseSession(state.session); }
         }

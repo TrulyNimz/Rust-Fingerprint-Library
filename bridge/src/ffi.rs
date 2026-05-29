@@ -1,20 +1,39 @@
 //! Runtime DLL loading for SecuGen SGFPLIB using Windows API directly.
 //! This runs in the 32-bit bridge process, so architecture matches the 32-bit DLL.
-//! Uses LoadLibraryW (not LoadLibraryExW) for maximum compatibility with DLL
-//! dependency resolution.
+//!
+//! Loader hardening: restricts the process-wide DLL search to System32 + the
+//! specific vendor directory we add via AddDllDirectory, blocking the legacy
+//! "search PATH and CWD" behaviour that allows DLL hijacking. Requires
+//! Windows 7 SP1 + KB2533623 or Windows 8+.
 
 use libc::{c_int, c_long, c_uchar, c_void};
 use std::ffi::CString;
 use std::path::Path;
+use std::sync::Once;
 
 pub type HSGFPM = *mut c_void;
 type HMODULE = *mut c_void;
 
+// Flags for SetDefaultDllDirectories / LoadLibraryExW.
+const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+const LOAD_LIBRARY_SEARCH_USER_DIRS: u32 = 0x0000_0400;
+
 extern "system" {
-    fn LoadLibraryW(path: *const u16) -> HMODULE;
+    fn LoadLibraryExW(path: *const u16, h_file: HMODULE, flags: u32) -> HMODULE;
     fn GetProcAddress(module: HMODULE, name: *const i8) -> *mut c_void;
-    fn SetDllDirectoryW(path: *const u16) -> i32;
+    fn AddDllDirectory(new_directory: *const u16) -> *mut c_void;
+    fn SetDefaultDllDirectories(flags: u32) -> i32;
     fn GetLastError() -> u32;
+}
+
+/// Restrict the process-wide DLL search to System32 + explicitly added dirs.
+/// Idempotent; safe to call from every loader.
+fn ensure_safe_dll_search() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
+    });
 }
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -22,7 +41,7 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 fn get_proc<T>(module: HMODULE, name: &str) -> Result<T, String> {
-    let cname = CString::new(name).unwrap();
+    let cname = CString::new(name).expect("DLL export names are static and null-byte-free");
     let addr = unsafe { GetProcAddress(module, cname.as_ptr()) };
     if addr.is_null() {
         return Err(format!("{} not found in DLL (error {})", name, unsafe {
@@ -106,22 +125,38 @@ pub struct SgfpLib {
 }
 
 impl SgfpLib {
-    /// Load the SecuGen DLL from the given path using LoadLibraryW.
-    /// Sets the DLL search directory first so transitive dependencies resolve.
+    /// Load the SecuGen DLL using a hardened search path.
+    /// Adds only the vendor's own directory; system DLLs come from System32.
+    /// Dependent DLLs (sgfpamx.dll, sgfdu05m.dll, sgwsqlib.dll) resolve via
+    /// the LOAD_LIBRARY_SEARCH_USER_DIRS list and System32 — never PATH or CWD.
     pub fn load(dll_path: &Path) -> Result<Self, String> {
-        // Set DLL search directory to the parent so dependencies resolve
+        ensure_safe_dll_search();
+
         if let Some(parent) = dll_path.parent() {
-            unsafe {
-                SetDllDirectoryW(to_wide(&parent.to_string_lossy()).as_ptr());
+            let wide_parent = to_wide(&parent.to_string_lossy());
+            let cookie = unsafe { AddDllDirectory(wide_parent.as_ptr()) };
+            if cookie.is_null() {
+                let err = unsafe { GetLastError() };
+                return Err(format!(
+                    "AddDllDirectory failed for {} (error {})",
+                    parent.display(),
+                    err
+                ));
             }
         }
 
         let wide_path = to_wide(&dll_path.to_string_lossy());
-        let module = unsafe { LoadLibraryW(wide_path.as_ptr()) };
+        let module = unsafe {
+            LoadLibraryExW(
+                wide_path.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
+        };
         if module.is_null() {
             let err = unsafe { GetLastError() };
             return Err(format!(
-                "Failed to load {} (LoadLibraryW error {})",
+                "Failed to load {} (LoadLibraryExW error {})",
                 dll_path.display(),
                 err
             ));

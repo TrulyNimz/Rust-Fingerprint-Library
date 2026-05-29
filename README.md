@@ -138,9 +138,10 @@ Copy the resulting `sgwsqlib.dll` alongside `sgfplib.dll`.
 The SDK finds `secugen-bridge.exe` in this order:
 
 1. `SECUGEN_BRIDGE_PATH` env var (exact path)
-2. Same directory as `node.exe`
-3. Current working directory
-4. Build output directory (development only)
+2. Same directory as the loaded `.node` addon
+3. Same directory as `node.exe`
+
+The CWD is **not** searched: a process whose working directory is attacker-writable would otherwise spawn a planted `secugen-bridge.exe`.
 
 ## Usage
 
@@ -303,6 +304,53 @@ cargo build --release -p fingerprint-updater
 ```
 
 Set the `GITHUB_TOKEN` env var to authenticate against private repositories or to raise rate limits.
+
+### Release signing (required for production builds)
+
+The updater verifies every downloaded zip with an Ed25519 signature. **Without an embedded public key it refuses to apply updates** unless `--allow-unsigned` is passed (development only — anyone who compromises the GitHub release can ship arbitrary code to your installs).
+
+**1. Generate a keypair (once, on an offline machine, store the secret key safely):**
+
+```bash
+# Any Ed25519 keypair generator works; e.g. with openssl 3.0+:
+openssl genpkey -algorithm ed25519 -out ed25519-priv.pem
+openssl pkey -in ed25519-priv.pem -pubout -outform DER 2>/dev/null \
+  | tail -c 32 | xxd -p -c 32     # 64 hex chars = the public key to embed
+```
+
+**2. Build the updater with the public key baked in:**
+
+```bash
+FINGERPRINT_UPDATE_PUBKEY=<64-hex-pubkey> cargo build --release -p fingerprint-updater
+```
+
+**3. Sign every release zip and publish the signature alongside the artifact:**
+
+```bash
+# Produces a 64-byte raw signature file
+openssl pkeyutl -sign -inkey ed25519-priv.pem \
+  -rawin -in fingerprint-sdk-v0.2.0-win32-x64.zip \
+  -out fingerprint-sdk-v0.2.0-win32-x64.sig
+```
+
+The asset name must be `fingerprint-sdk-v<version>-win32-x64.sig`. The updater fetches it from the same GitHub release as the zip and verifies before extraction.
+
+> Existing `.sha256` checksum files remain supported as a defense-in-depth integrity check, but **signatures are the authenticity check** — checksums hosted next to the zip prove nothing if the release itself is compromised.
+
+## Biometric data handling
+
+Fingerprint images and templates are special-category personal data under GDPR Article 9, BIPA, and similar regimes. This SDK applies basic in-memory hygiene on its side of the boundary:
+
+- Intermediate image/template buffers in the 32-bit bridge are zeroized after each IPC round-trip
+- The JSON IPC payload (which carries raw bytes) is zeroized on both ends after send/receive
+- Cloned template bytes inside the SDK marshalling layer are zeroized after the command is dispatched
+
+**Once data crosses into JavaScript, the calling application owns its lifecycle.** Anything you receive from `captureFingerprint`, `enrollUser`, or `verifyUser` lives in the V8 heap and Rust cannot zeroize it for you. Treat templates and raw images as you would any other regulated PII:
+
+- Encrypt at rest (use a dedicated secrets manager / KMS, not plain disk)
+- Avoid persisting raw images unless explicitly required — store only the matched template ID
+- Restrict log output: never log template bytes, image bytes, or `userId` together with biometric scores
+- Where possible, hand off to a `Buffer` and explicitly `buffer.fill(0)` after use
 
 ## Known Limitations
 
