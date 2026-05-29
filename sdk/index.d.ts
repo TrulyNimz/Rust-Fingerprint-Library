@@ -44,6 +44,13 @@ export interface ScannerStatusInfo {
   vendor?: string
   model?: string
 }
+export interface UpdateInfo {
+  updateAvailable: boolean
+  currentVersion: string
+  latestVersion?: string
+  releaseUrl?: string
+}
+export declare function checkForUpdate(): Promise<UpdateInfo>
 export declare function initScanner(vendor?: string | undefined | null): Promise<DeviceInfo>
 export declare function captureFingerprint(options?: CaptureOptions | undefined | null): Promise<ScanResult>
 export declare function enrollUser(userId: string, samples?: number | undefined | null): Promise<Template>

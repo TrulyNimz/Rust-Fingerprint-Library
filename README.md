@@ -253,15 +253,18 @@ Rust-Fingerprint-Library/                Cargo workspace
     src/lib.rs
   bridge/                                32-bit bridge binary (Windows only)
     src/
-      main.rs                            stdin/stdout JSON line loop
-      ffi.rs                             LoadLibraryW/GetProcAddress runtime loading
+      main.rs                            stdin/stdout JSON line loop, bounded reads, zeroize
+      ffi.rs                             Hardened DLL loader (LoadLibraryExW + AddDllDirectory
+                                         + SetDefaultDllDirectories; no PATH/CWD search)
+    tests/
+      ipc.rs                             End-to-end IPC integration tests (spawn real bridge)
     sgwsqlib_stub.c                      Stub DLL source for missing import dependency
     sgwsqlib.def                         Linker definition for stdcall exports
     cl_args.rsp                          MSVC response file for building the stub
   sdk/                                   64-bit napi-rs addon (all platforms)
     src/
-      lib.rs                             napi-rs async exports
-      update_check.rs                    GitHub Releases update check
+      lib.rs                             napi-rs async exports + init-while-busy guard
+      update_check.rs                    GitHub Releases update check (URL-redacting errors)
       fp_core/
         traits.rs                        FingerprintScanner trait (vendor contract)
         types.rs                         Shared types with #[napi(object)]
@@ -273,9 +276,13 @@ Rust-Fingerprint-Library/                Cargo workspace
         neurotec/mod.rs                  Neurotec FFV SDK client (Windows)
         template/mod.rs                  Blank vendor scaffold
     package.json
-  updater/                               Optional self-updater CLI (downloads releases from GitHub)
+  updater/                               Self-updater CLI with Ed25519 signature verification
     src/
       main.rs, lib.rs, github.rs, assets.rs, apply.rs, version.rs
+    examples/
+      keygen.rs                          Generate the Ed25519 release-signing keypair
+      sign_release.rs                    Sign a release zip; three refuse-by-default guards
+      verify_self_test.rs                Round-trip a generated keypair through the prod verifier
   examples/
     basic.ts                             Full usage example (SecuGen)
     quick_test.ts                        Minimal init + capture (SecuGen)
@@ -297,9 +304,10 @@ Rust-Fingerprint-Library/                Cargo workspace
 The SDK exposes an opt-in `checkForUpdate()` function (queries the configured GitHub Releases endpoint). A standalone `fingerprint-updater` CLI (in the `updater/` crate) can also download and apply releases:
 
 ```bash
-cargo build --release -p fingerprint-updater
+FINGERPRINT_UPDATE_PUBKEY=<64-hex-pubkey> cargo build --release -p fingerprint-updater
 ./target/release/fingerprint-updater check
-./target/release/fingerprint-updater update
+./target/release/fingerprint-updater update                 # refuses unsigned releases by default
+./target/release/fingerprint-updater update --allow-unsigned  # dev/internal only — prints a loud warning
 ./target/release/fingerprint-updater rollback
 ```
 
@@ -307,35 +315,44 @@ Set the `GITHUB_TOKEN` env var to authenticate against private repositories or t
 
 ### Release signing (required for production builds)
 
-The updater verifies every downloaded zip with an Ed25519 signature. **Without an embedded public key it refuses to apply updates** unless `--allow-unsigned` is passed (development only — anyone who compromises the GitHub release can ship arbitrary code to your installs).
+The updater verifies every downloaded zip with an Ed25519 signature. **Without an embedded public key it refuses to apply updates** unless `--allow-unsigned` is passed (development only — anyone who compromises the GitHub release can ship arbitrary code to your installs). Existing `.sha256` checksum files remain supported as a defense-in-depth integrity check, but **signatures are the authenticity check** — checksums hosted next to the zip prove nothing if the release itself is compromised.
 
-**1. Generate a keypair (once, on an offline machine, store the secret key safely):**
+The `updater/examples/` directory ships three operational tools that all exercise the same code path as the runtime verifier. Using them avoids any chance of a producer/verifier encoding mismatch.
+
+**1. Generate the signing keypair (one-time):**
 
 ```bash
-# Any Ed25519 keypair generator works; e.g. with openssl 3.0+:
-openssl genpkey -algorithm ed25519 -out ed25519-priv.pem
-openssl pkey -in ed25519-priv.pem -pubout -outform DER 2>/dev/null \
-  | tail -c 32 | xxd -p -c 32     # 64 hex chars = the public key to embed
+cargo run --example keygen -p fingerprint-updater -- ~/.fingerprint-sdk/signing-key.bin
 ```
 
-**2. Build the updater with the public key baked in:**
+Outputs the public key on stdout as 64 hex chars; writes the 32-byte private key to the path you supply. Move the private key to secure storage (HSM, hardware token, password manager) **immediately** — losing it forces a cross-channel pubkey rotation across every install, which is a multi-month migration. The example refuses to overwrite an existing file so you can't accidentally clobber the key by re-running.
+
+**2. Confirm the keypair round-trips through the production verifier** (recommended sanity check):
+
+```bash
+cargo run --example verify_self_test -p fingerprint-updater -- \
+    ~/.fingerprint-sdk/signing-key.bin \
+    <public-key-hex>
+```
+
+**3. Build release binaries with the public key baked in:**
 
 ```bash
 FINGERPRINT_UPDATE_PUBKEY=<64-hex-pubkey> cargo build --release -p fingerprint-updater
 ```
 
-**3. Sign every release zip and publish the signature alongside the artifact:**
+**4. Sign every release zip before upload:**
 
 ```bash
-# Produces a 64-byte raw signature file
-openssl pkeyutl -sign -inkey ed25519-priv.pem \
-  -rawin -in fingerprint-sdk-v0.2.0-win32-x64.zip \
-  -out fingerprint-sdk-v0.2.0-win32-x64.sig
+FINGERPRINT_UPDATE_PUBKEY=<64-hex-pubkey> \
+    cargo run --example sign_release -p fingerprint-updater --release -- \
+    ~/.fingerprint-sdk/signing-key.bin \
+    fingerprint-sdk-v<version>-win32-x64.zip
 ```
 
-The asset name must be `fingerprint-sdk-v<version>-win32-x64.sig`. The updater fetches it from the same GitHub release as the zip and verifies before extraction.
+The `sign_release` example refuses to write the `.sig` file unless: (a) `FINGERPRINT_UPDATE_PUBKEY` is set, (b) the private key on disk derives that exact public key, and (c) the freshly-produced signature round-trips through `assets::verify_signature` — the same function every install runs. Upload the resulting `fingerprint-sdk-v<version>-win32-x64.sig` alongside the zip on GitHub Releases.
 
-> Existing `.sha256` checksum files remain supported as a defense-in-depth integrity check, but **signatures are the authenticity check** — checksums hosted next to the zip prove nothing if the release itself is compromised.
+If you'd rather sign with external tooling, any Ed25519 signer that produces a raw 64-byte signature works. `openssl pkeyutl -sign -rawin` requires the private key in PKCS#8 PEM form first; the example above sidesteps that conversion.
 
 ## Biometric data handling
 
@@ -351,6 +368,22 @@ Fingerprint images and templates are special-category personal data under GDPR A
 - Avoid persisting raw images unless explicitly required — store only the matched template ID
 - Restrict log output: never log template bytes, image bytes, or `userId` together with biometric scores
 - Where possible, hand off to a `Buffer` and explicitly `buffer.fill(0)` after use
+
+## Testing
+
+Three tiers of automated coverage, all runnable from the repo root:
+
+```bash
+# Tier 1+2 — pure unit + IPC integration (no hardware needed)
+cargo test --workspace
+```
+
+- **Tier 1 unit tests**: signature verification (`verify_signature`, `parse_pubkey_hex`), checksum compare, zip-bomb caps, ZipSlip flattening, bounded IPC line reads, biometric-buffer zeroize across every `BridgeCommand`/`BridgeResponse` variant. 31 tests across `bridge/` and `updater/`.
+- **Tier 2 IPC integration tests** (`bridge/tests/ipc.rs`): spawns the real bridge binary, exercises the state machine (`NOT_INITIALIZED` for every pre-init command), framing robustness (malformed JSON, unknown action tags, blank-line skipping, command ordering), and graceful init failure when the SecuGen DLL is missing. 11 tests.
+
+> On Windows, `cargo test -p fingerprint-updater` may fail with `os error 740` because UAC's installer-detection heuristic flags any executable whose name contains `update`. Workaround: `cargo test -p fingerprint-updater --no-run` then copy the test exe to any name without trigger keywords (e.g. `cp target/debug/deps/fingerprint_updater-*.exe target/fpu_test.exe && target/fpu_test.exe`).
+
+- **Tier 3 — live hardware**: `npx tsx examples/quick_test.ts` (init + capture + disconnect) and `npx tsx examples/basic.ts` (full lifecycle: init + capture + enroll + verify + identify + disconnect) against a connected SecuGen Hamster Plus. Both verified passing on the post-hardening codebase (capture quality 99, match scores 199).
 
 ## Known Limitations
 

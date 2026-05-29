@@ -310,9 +310,10 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { ScannerStatus, initScanner, captureFingerprint, enrollUser, verifyUser, identifyUser, disconnectScanner, getScannerStatus } = nativeBinding
+const { ScannerStatus, checkForUpdate, initScanner, captureFingerprint, enrollUser, verifyUser, identifyUser, disconnectScanner, getScannerStatus } = nativeBinding
 
 module.exports.ScannerStatus = ScannerStatus
+module.exports.checkForUpdate = checkForUpdate
 module.exports.initScanner = initScanner
 module.exports.captureFingerprint = captureFingerprint
 module.exports.enrollUser = enrollUser
