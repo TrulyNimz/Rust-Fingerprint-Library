@@ -1,4 +1,5 @@
 pub mod constants;
+mod error_map;
 mod ffi_types;
 
 use std::io::{BufRead, BufReader, Read, Write};
