@@ -1,4 +1,5 @@
 pub mod constants;
+mod ffi_types;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
