@@ -91,15 +91,16 @@ Concurrency: the SecuGen handle is owned by the `NativeClient` and protected by 
 
 Mirror the Windows lookup order so operators have one mental model. First match wins:
 
-1. `SECUGEN_LIB_PATH` env var — exact path to the shared library. Cross-platform name.
-2. `SECUGEN_SDK_PATH` env var — directory; we append the platform-specific filename.
-3. Sibling of the Node process executable (`std::env::current_exe()` → its parent directory). Note: this resolves to `node`'s directory, which is rarely useful in practice — `SECUGEN_LIB_PATH` / `SECUGEN_SDK_PATH` is the recommended operator knob. We keep this step for parity with the Windows lookup, not because we expect it to match.
-4. Standard system paths:
+1. `SECUGEN_LIB_PATH` env var — exact path to the shared library. Preferred cross-platform name.
+2. `SECUGEN_DLL_PATH` env var — exact path; same semantics as `SECUGEN_LIB_PATH`. Honoured on all platforms so a single env var works across a mixed-OS deployment. The "DLL" naming is legacy but kept working everywhere.
+3. `SECUGEN_SDK_PATH` env var — directory; we append the platform-specific filename.
+4. Sibling of the Node process executable (`std::env::current_exe()` → its parent directory). Note: this resolves to `node`'s directory, which is rarely useful in practice — `SECUGEN_LIB_PATH` / `SECUGEN_SDK_PATH` is the recommended operator knob. We keep this step for parity with the Windows lookup, not because we expect it to match.
+5. Standard system paths:
    - Linux: `/usr/local/lib/libsgfplib.so`, `/usr/lib/libsgfplib.so`, `/opt/SecuGen/lib/libsgfplib.so`.
    - macOS: `/usr/local/lib/libsgfplib.dylib`, `/opt/SecuGen/lib/libsgfplib.dylib`.
-5. Bare filename (`libsgfplib.so` / `libsgfplib.dylib`) handed to `dlopen`, letting the OS loader's own search (`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, system caches) take over.
+6. Bare filename (`libsgfplib.so` / `libsgfplib.dylib`) handed to `dlopen`, letting the OS loader's own search (`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, system caches) take over.
 
-`SECUGEN_DLL_PATH` continues to work on Windows only; on non-Windows it's ignored to keep the operator-facing convention crisp ("DLL" implies Windows).
+The Windows lookup is updated to mirror the same env-var precedence: `SECUGEN_LIB_PATH` first (new), `SECUGEN_DLL_PATH` second (existing), `SECUGEN_SDK_PATH` third (existing), then the same fallback chain as today.
 
 ### Symbol surface
 
