@@ -1,6 +1,7 @@
 pub mod constants;
 mod error_map;
 mod ffi_types;
+mod library_path;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
