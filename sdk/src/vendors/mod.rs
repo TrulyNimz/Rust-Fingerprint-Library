@@ -18,14 +18,15 @@ pub fn get_scanner(vendor: Option<&str>) -> Result<Box<dyn FingerprintScanner>, 
         #[cfg(windows)]
         "neurotec" | "neurotechnology" => Ok(Box::new(neurotec::NeurotecScanner::new())),
         "auto" => {
-            // Try WBF first (works with any Windows biometric device), fall back to SecuGen
             #[cfg(windows)]
             {
+                // Windows: try WBF first (any biometric device), fall back to SecuGen.
                 Ok(Box::new(wbf::WbfScanner::new()))
             }
             #[cfg(not(windows))]
             {
-                Err(FingerprintError::DeviceNotFound)
+                // Linux / macOS: SecuGen is the only implemented vendor today.
+                Ok(Box::new(SecuGenScanner::new()))
             }
         }
         other => Err(FingerprintError::UnsupportedVendor(other.to_string())),

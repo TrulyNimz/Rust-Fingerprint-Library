@@ -17,6 +17,8 @@ use crate::fp_core::types::{DeviceInfo, MatchResult, ScanResult, Template};
 
 #[cfg(windows)]
 use self::bridge::BridgeBackend;
+#[cfg(not(windows))]
+use self::native::NativeBackend;
 
 pub struct SecuGenScanner {
     backend: Mutex<Option<Backend>>,
@@ -25,6 +27,8 @@ pub struct SecuGenScanner {
 enum Backend {
     #[cfg(windows)]
     Bridge(BridgeBackend),
+    #[cfg(not(windows))]
+    Native(NativeBackend),
 }
 
 impl SecuGenScanner {
@@ -56,9 +60,10 @@ impl FingerprintScanner for SecuGenScanner {
         }
         #[cfg(not(windows))]
         {
-            Err(FingerprintError::SdkError(
-                "SecuGen native backend not yet wired up (lands in Task 6)".to_string(),
-            ))
+            let (backend, info) = NativeBackend::init()?;
+            *self.backend.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Backend::Native(backend));
+            Ok(info)
         }
     }
 
@@ -66,6 +71,8 @@ impl FingerprintScanner for SecuGenScanner {
         self.with_backend(|b| match b {
             #[cfg(windows)]
             Backend::Bridge(br) => br.capture(timeout_ms, min_quality),
+            #[cfg(not(windows))]
+            Backend::Native(n) => n.capture(timeout_ms, min_quality),
         })
     }
 
@@ -73,6 +80,8 @@ impl FingerprintScanner for SecuGenScanner {
         self.with_backend(|b| match b {
             #[cfg(windows)]
             Backend::Bridge(br) => br.enroll(user_id, samples),
+            #[cfg(not(windows))]
+            Backend::Native(n) => n.enroll(user_id, samples),
         })
     }
 
@@ -80,6 +89,8 @@ impl FingerprintScanner for SecuGenScanner {
         self.with_backend(|b| match b {
             #[cfg(windows)]
             Backend::Bridge(br) => br.verify(user_id, template),
+            #[cfg(not(windows))]
+            Backend::Native(n) => n.verify(user_id, template),
         })
     }
 
@@ -87,6 +98,8 @@ impl FingerprintScanner for SecuGenScanner {
         self.with_backend(|b| match b {
             #[cfg(windows)]
             Backend::Bridge(br) => br.identify(templates),
+            #[cfg(not(windows))]
+            Backend::Native(n) => n.identify(templates),
         })
     }
 
@@ -94,6 +107,8 @@ impl FingerprintScanner for SecuGenScanner {
         self.with_backend(|b| match b {
             #[cfg(windows)]
             Backend::Bridge(br) => br.get_quality(image),
+            #[cfg(not(windows))]
+            Backend::Native(n) => n.get_quality(image),
         })
     }
 
@@ -103,6 +118,8 @@ impl FingerprintScanner for SecuGenScanner {
             match backend {
                 #[cfg(windows)]
                 Backend::Bridge(br) => br.shutdown(),
+                #[cfg(not(windows))]
+                Backend::Native(n) => n.shutdown(),
             }
         }
         Ok(())
