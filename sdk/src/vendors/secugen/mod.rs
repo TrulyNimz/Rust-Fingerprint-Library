@@ -6,6 +6,9 @@ mod library_path;
 #[cfg(windows)]
 mod bridge;
 
+#[cfg(not(windows))]
+mod native;
+
 use std::sync::Mutex;
 
 use crate::fp_core::errors::FingerprintError;
