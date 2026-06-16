@@ -20,6 +20,20 @@ pub use crate::update_check::check_for_update;
 
 static SCANNER: Mutex<Option<Box<dyn FingerprintScanner>>> = Mutex::new(None);
 
+fn join_err_to_napi(e: tokio::task::JoinError) -> napi::Error {
+    let reason = if e.is_panic() {
+        "Vendor library panicked during operation"
+    } else if e.is_cancelled() {
+        "Operation cancelled"
+    } else {
+        "Operation aborted"
+    };
+    napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("[SDK_ERROR] {}", reason),
+    )
+}
+
 /// Take the global scanner lock, recovering from poisoning. A poisoned mutex
 /// only means a previous holder panicked — the inner state is still readable,
 /// and a process-wide wedge serves nobody.
@@ -27,14 +41,15 @@ fn lock_scanner() -> MutexGuard<'static, Option<Box<dyn FingerprintScanner>>> {
     SCANNER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Await a `spawn_blocking` task, turning a JoinError (task panic) into a
-/// usable napi error instead of re-panicking the executor.
+/// Await a `spawn_blocking` task, turning a JoinError (task panic or
+/// cancellation) into a clean `[SDK_ERROR]` napi error instead of
+/// re-raising the panic into the napi runtime.
 async fn join_blocking<T>(
     handle: tokio::task::JoinHandle<Result<T, FingerprintError>>,
 ) -> napi::Result<T> {
     handle
         .await
-        .map_err(|e| napi::Error::from_reason(format!("worker task panicked: {e}")))?
+        .map_err(join_err_to_napi)?
         .map_err(napi::Error::from)
 }
 
