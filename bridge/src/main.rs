@@ -118,7 +118,15 @@ fn zeroize_command(cmd: &mut BridgeCommand) {
 }
 
 fn find_dll_path() -> PathBuf {
-    // 1. SECUGEN_DLL_PATH env var (exact path to DLL)
+    // 1. SECUGEN_LIB_PATH env var (preferred cross-platform name)
+    if let Ok(path) = env::var("SECUGEN_LIB_PATH") {
+        let p = PathBuf::from(&path);
+        if p.exists() {
+            return p;
+        }
+    }
+
+    // 2. SECUGEN_DLL_PATH env var (legacy alias, kept for back-compat)
     if let Ok(path) = env::var("SECUGEN_DLL_PATH") {
         let p = PathBuf::from(&path);
         if p.exists() {
@@ -126,7 +134,7 @@ fn find_dll_path() -> PathBuf {
         }
     }
 
-    // 2. SECUGEN_SDK_PATH env var (directory containing DLL)
+    // 3. SECUGEN_SDK_PATH env var (directory containing DLL)
     if let Ok(path) = env::var("SECUGEN_SDK_PATH") {
         let p = PathBuf::from(&path).join("sgfplib.dll");
         if p.exists() {
@@ -134,7 +142,7 @@ fn find_dll_path() -> PathBuf {
         }
     }
 
-    // 3. Same directory as the bridge executable
+    // 4. Same directory as the bridge executable
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("sgfplib.dll");
@@ -144,13 +152,12 @@ fn find_dll_path() -> PathBuf {
         }
     }
 
-    // 4. Known SDK paths
+    // 5. Known SDK paths
     let candidates = [
         r"C:\SecuGen\SDK\FDx SDK Pro for Windows v4.3.1_J1.12\FDx SDK Pro for Java v1.12\jnisgfplib\win32\sgfplib.dll",
         r"C:\Program Files\SecuGen\FDx SDK Pro for Windows\lib\sgfplib.dll",
         r"C:\Program Files (x86)\SecuGen\FDx SDK Pro for Windows\lib\sgfplib.dll",
     ];
-
     for path in &candidates {
         let p = PathBuf::from(path);
         if p.exists() {
@@ -158,7 +165,7 @@ fn find_dll_path() -> PathBuf {
         }
     }
 
-    // Fallback — let libloading search PATH
+    // 6. Bare filename — let the Windows loader's own rules apply
     PathBuf::from("sgfplib.dll")
 }
 
