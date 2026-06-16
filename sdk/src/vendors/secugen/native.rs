@@ -12,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use libc::{dlclose, dlerror, dlopen, dlsym, RTLD_NOW};
 
+use zeroize::Zeroize;
+
 use crate::fp_core::errors::FingerprintError;
 use crate::fp_core::types::{DeviceInfo, MatchResult, ScanResult, Template};
 
@@ -189,11 +191,21 @@ impl NativeBackend {
         let mut best_quality: i32 = -1;
 
         for _ in 0..sample_count {
-            let (image, quality) = self.capture_image(10_000, 60)?;
+            let (mut image, quality) = self.capture_image(10_000, 60)?;
             let template = self.create_template_from_image(&image)?;
+            // Raw image is no longer needed once the template is extracted.
+            image.zeroize();
             if (quality as i32) > best_quality {
                 best_quality = quality as i32;
-                best_template = Some(template);
+                // Wipe the previously-best template before replacing it; otherwise
+                // a worse-quality sample's bytes linger in freed heap.
+                if let Some(mut prior) = best_template.replace(template) {
+                    prior.zeroize();
+                }
+            } else {
+                // This sample didn't win — wipe its template before drop.
+                let mut t = template;
+                t.zeroize();
             }
         }
 
@@ -214,8 +226,10 @@ impl NativeBackend {
         user_id: &str,
         template: &Template,
     ) -> Result<MatchResult, FingerprintError> {
-        let (image, _) = self.capture_image(10_000, 60)?;
+        let (mut image, _) = self.capture_image(10_000, 60)?;
         let live_template = self.create_template_from_image(&image)?;
+        image.zeroize();
+        let mut live_template = live_template;
 
         let mut score: c_long = 0;
         let code = unsafe {
@@ -227,6 +241,7 @@ impl NativeBackend {
             )
         };
         if code != 0 {
+            live_template.zeroize();
             return Err(map_sdk_code(code, 0));
         }
 
@@ -241,10 +256,11 @@ impl NativeBackend {
             )
         };
         if code != 0 {
+            live_template.zeroize();
             return Err(map_sdk_code(code, 0));
         }
 
-        Ok(MatchResult {
+        let result = MatchResult {
             matched: matched != 0,
             score: score as u32,
             user_id: if matched != 0 {
@@ -252,7 +268,9 @@ impl NativeBackend {
             } else {
                 None
             },
-        })
+        };
+        live_template.zeroize();
+        Ok(result)
     }
 
     pub fn identify(&mut self, templates: &[Template]) -> Result<MatchResult, FingerprintError> {
@@ -260,8 +278,10 @@ impl NativeBackend {
             return Err(FingerprintError::MatchFailed);
         }
 
-        let (image, _) = self.capture_image(10_000, 60)?;
+        let (mut image, _) = self.capture_image(10_000, 60)?;
         let live_template = self.create_template_from_image(&image)?;
+        image.zeroize();
+        let mut live_template = live_template;
 
         let mut best_score: c_long = 0;
         let mut best_user_id: Option<String> = None;
@@ -278,6 +298,7 @@ impl NativeBackend {
                 )
             };
             if code != 0 {
+                live_template.zeroize();
                 return Err(map_sdk_code(code, 0));
             }
             if score > best_score {
@@ -299,14 +320,18 @@ impl NativeBackend {
                 )
             };
             if code != 0 {
+                live_template.zeroize();
                 return Err(map_sdk_code(code, 0));
             }
-            Ok(MatchResult {
+            let result = MatchResult {
                 matched: matched != 0,
                 score: best_score as u32,
                 user_id: if matched != 0 { best_user_id } else { None },
-            })
+            };
+            live_template.zeroize();
+            Ok(result)
         } else {
+            live_template.zeroize();
             Ok(MatchResult {
                 matched: false,
                 score: 0,

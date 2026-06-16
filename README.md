@@ -100,7 +100,7 @@ cp target/i686-pc-windows-msvc/release/secugen-bridge.exe sdk/
 cp bridge/sgwsqlib.dll sdk/
 ```
 
-`sgfplib.dll`, `sgfpamx.dll`, and `sgfdu05m.dll` must be available via `SECUGEN_DLL_PATH` / `SECUGEN_SDK_PATH` or sit next to the bridge executable (see "Setup" below).
+`sgfplib.dll`, `sgfpamx.dll`, and `sgfdu05m.dll` must be available via `SECUGEN_LIB_PATH` / `SECUGEN_DLL_PATH` / `SECUGEN_SDK_PATH` or sit next to the bridge executable (see "Setup" below).
 
 ### Linux
 
