@@ -12,8 +12,8 @@ Vendor-agnostic, cross-platform fingerprint scanner SDK for Node.js, built with 
 |----------|---------|---------------|----------|--------|
 | Windows  | SecuGen | Hamster Plus  | Out-of-process bridge (32-bit DLL) | Verified (full) |
 | Windows  | WBF (any) | Goodix, Synaptics, etc. | Native WinBio API (64-bit) | Init only (see note) |
-| macOS    | —       | —             | Direct FFI (64-bit dylib) | Planned |
-| Linux    | —       | —             | Direct FFI (64-bit .so) | Planned |
+| Linux (x86_64) | SecuGen | Hamster Plus | Direct FFI to `libsgfplib.so` (64-bit) | Build supported, verify on host |
+| macOS (x86_64 / arm64) | SecuGen | Hamster Plus | Direct FFI to `libsgfplib.dylib` (64-bit) | Build supported, verify on host |
 
 > **WBF Note**: The Windows Biometric Framework vendor (`initScanner('wbf')`) can detect and enumerate any WBF-registered fingerprint sensor. However, MOC (Match-on-Chip) sensors like the Goodix/Suprema BioMini Slim 2 keep fingerprint data on-chip and the Windows biometric service holds an exclusive lock when Windows Hello is enrolled. Capture/verify/identify require the vendor's native SDK for full functionality. Non-MOC sensors (swipe/area sensors with host-based matching) may support full WBF capture.
 
@@ -69,9 +69,14 @@ SecuGen's `sgfplib.dll` is 32-bit only. A 64-bit Node.js process cannot load it 
 - **MSVC Build Tools**: For compiling the stub `sgwsqlib.dll`
 - **SecuGen FDx SDK Pro**: `sgfplib.dll` (32-bit) — not redistributable, obtain from SecuGen
 
-### macOS / Linux
+### Linux
 
-No additional prerequisites beyond Rust and Node.js. Vendor-specific SDK libraries will be documented per vendor.
+- **SecuGen FDx SDK Pro for Linux** — install `libsgfplib.so` (and companion driver `.so` files) from SecuGen. Not redistributable; obtain from the vendor.
+- Standard glibc-based distros are expected to work; the library only depends on POSIX `dlopen` semantics.
+
+### macOS
+
+- **SecuGen FDx SDK Pro for macOS** — install `libsgfplib.dylib` from SecuGen. macOS Touch ID is **not** supported; Apple's `LocalAuthentication` API hides the sensor and exposes only an authenticate prompt.
 
 ## Build
 
@@ -97,12 +102,21 @@ cp bridge/sgwsqlib.dll sdk/
 
 `sgfplib.dll`, `sgfpamx.dll`, and `sgfdu05m.dll` must be available via `SECUGEN_DLL_PATH` / `SECUGEN_SDK_PATH` or sit next to the bridge executable (see "Setup" below).
 
-### macOS / Linux
+### Linux
 
 ```bash
-# No bridge needed — just build the napi-rs addon
 cd sdk && npx napi build --platform --release
 ```
+
+This produces `fingerprint-sdk.linux-x64-gnu.node` (or `linux-arm64-gnu.node` on ARM). No bridge process is needed — the 64-bit Node process loads `libsgfplib.so` directly. Set `SECUGEN_LIB_PATH` or place the library in a standard location (see Setup).
+
+### macOS
+
+```bash
+cd sdk && npx napi build --platform --release
+```
+
+Produces `fingerprint-sdk.darwin-x64.node` (Intel) or `darwin-arm64.node` (Apple silicon). Install `libsgfplib.dylib` from the SecuGen macOS SDK; Apple-silicon support depends on the vendor shipping an arm64 build.
 
 ## Setup
 
@@ -110,10 +124,11 @@ cd sdk && npx napi build --platform --release
 
 The bridge process finds `sgfplib.dll` in this order:
 
-1. `SECUGEN_DLL_PATH` env var (exact path to DLL)
-2. `SECUGEN_SDK_PATH` env var (directory containing DLL)
-3. Same directory as `secugen-bridge.exe`
-4. Known SDK install paths
+1. `SECUGEN_LIB_PATH` env var (exact path to DLL — preferred cross-platform name)
+2. `SECUGEN_DLL_PATH` env var (exact path; legacy alias, still honoured)
+3. `SECUGEN_SDK_PATH` env var (directory containing DLL)
+4. Same directory as `secugen-bridge.exe`
+5. Known SDK install paths
 
 The following DLLs must be in the same directory as `sgfplib.dll`:
 
@@ -122,6 +137,21 @@ The following DLLs must be in the same directory as `sgfplib.dll`:
 | `sgfpamx.dll` | Matching algorithm | SecuGen SDK |
 | `sgfdu05m.dll` | Device driver (varies by model) | SecuGen SDK |
 | `sgwsqlib.dll` | WSQ codec | Stub provided (see below) |
+
+### SecuGen Library Resolution (Linux / macOS)
+
+The native client finds `libsgfplib.so` (Linux) or `libsgfplib.dylib` (macOS) in this order:
+
+1. `SECUGEN_LIB_PATH` env var — exact path to the library (preferred name).
+2. `SECUGEN_DLL_PATH` env var — exact path; honoured cross-platform for ops convenience.
+3. `SECUGEN_SDK_PATH` env var — directory containing the library.
+4. Same directory as the Node executable (parity step).
+5. Platform default paths:
+   - Linux: `/usr/local/lib`, `/usr/lib`, `/opt/SecuGen/lib`
+   - macOS: `/usr/local/lib`, `/opt/homebrew/lib`, `/opt/SecuGen/lib`
+6. Bare filename — handed to `dlopen`, falling back to `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH` and the system cache.
+
+All vendor companion libraries (`libsgfpamx.*`, the device driver `.so`/`.dylib`) must be discoverable through the same OS loader rules — typically placed in the same directory as the main library.
 
 ### Stub sgwsqlib.dll
 
@@ -387,10 +417,10 @@ cargo test --workspace
 
 ## Known Limitations
 
-- **Verified vendor**: SecuGen is the only vendor exercised end-to-end on real hardware so far. WBF and Neurotec modules compile and can initialise compatible devices; capture/match behaviour depends on the underlying sensor (MOC sensors expose limited functionality through WBF — see WBF note above).
-- **Windows-only**: All three current vendor modules are Windows-only. macOS / Linux vendor implementations would link a 64-bit native library directly (no bridge required).
+- **Verified vendor**: SecuGen is the only vendor exercised end-to-end on real hardware so far. WBF and Neurotec modules compile on Windows; capture/match behaviour depends on the underlying sensor.
+- **macOS Touch ID is not supported**: Apple's `LocalAuthentication` framework hides the sensor and exposes only "authenticate this user", never raw image or template data. macOS support means USB sensors with vendor SDKs (e.g. SecuGen Hamster Plus over USB).
+- **No automatic reconnect mid-capture**: If a scanner is unplugged mid-operation, calls return `DEVICE_NOT_FOUND`. Call `disconnectScanner()` then `initScanner()` to recover — the library reload and device re-init happen cleanly.
 - **Single scanner**: The global state supports one connected scanner at a time.
-- **No automatic reconnect**: If the bridge process crashes, call `disconnectScanner()` then `initScanner()` again.
 - **Binary data as `number[]`**: Images and templates are JSON arrays. A future optimization could use `Buffer` via napi-rs for better performance with large payloads.
 
 ## Contributing
